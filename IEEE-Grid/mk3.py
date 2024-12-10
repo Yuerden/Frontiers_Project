@@ -21,9 +21,7 @@ x = P_gen / P_gen_max  # Generators' capacity utilization
 A = np.zeros((N, N))
 
 # Connect each generator to all loads (fully connected bipartite graph)
-# for j in range(g, N):  # Loads
-#     A[0][j] = 1  # Connection from generator i to load j
-#     A[j][0] = 1  # Connection from load j to generator i
+# for i in range(1):  # Generators
 for i in range(g):  # Generators
     for j in range(g, N):  # Loads
         A[i][j] = 1  # Connection from generator i to load j
