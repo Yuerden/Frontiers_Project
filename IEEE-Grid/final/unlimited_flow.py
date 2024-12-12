@@ -1,5 +1,8 @@
+import json
 import numpy as np
 import random
+import csv
+import os
 
 # Example: Node 0 and 1 are generators, Node 2-5 are loads
 # generators = [0, 1]
@@ -39,14 +42,11 @@ import json
 with open("systems_config.json", "r") as f:
     loaded_systems = json.load(f)
 
-# Example: access IEEE14 system
-ieee14_system = loaded_systems["IEEE14"]
-generators = ieee14_system["generators"]
-generation = ieee14_system["generation"]
-loads = ieee14_system["loads"]
-demand = ieee14_system["demand"]
-adjacency_matrix = np.array(ieee14_system["adjacency_matrix"])
+SYSTEM_NAME = "IEEE14" # IEEE14,30,57,118
 
+# ============================
+# Define Helper Functions
+# ============================
 
 def find_connected_components(adjacency_matrix):
     """
@@ -154,6 +154,57 @@ def create_bipartite_graph(adjacency_matrix, generators, loads, demand):
 
     return bipartite_graph, component_demands
 
+def calculate_B_eff(A_matrix, load_states):
+    """
+    Calculate B_eff = (1^T * A * s_in) / (1^T * A * 1)
+
+    Args:
+        A_matrix: Adjacency matrix as a 2D list or NumPy array
+        load_states: dict mapping load node indices to their states
+
+    Returns:
+        B_eff: float
+    """
+    A = np.array(A_matrix)
+    num_nodes = A.shape[0]
+    s_in = np.zeros(num_nodes)
+    for load_node, state in load_states.items():
+        s_in[load_node] = state
+    numerator = np.sum(A * s_in)
+    denominator = np.sum(A)
+    if denominator == 0:
+        return 0
+    B_eff = numerator / denominator
+    return B_eff
+
+def record_data(file_name, f_i, x_eff, B_eff):
+    """
+    Records the simulation data to a CSV file.
+
+    Args:
+        file_name: Path to the CSV file.
+        f_i: Fraction parameter (e.g., f_g for generator failure).
+        x_eff: System efficiency.
+        B_eff: Calculated B_eff value.
+    """
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+    
+    # Check if the file exists to write headers
+    file_exists = os.path.isfile(file_name)
+    
+    with open(file_name, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            # Write header
+            writer.writerow(['f_i', 'x_eff', 'B_eff'])
+        # Write data row
+        writer.writerow([f_i, x_eff, B_eff])
+
+# ============================
+# Define Optimization Functions
+# ============================
+
 def optimize_power_distribution_refined(bipartite_graph, component_demands, generation):
     """
     Optimizes power distribution, prioritizing components with the least number of generators
@@ -214,47 +265,70 @@ def optimize_power_distribution_refined(bipartite_graph, component_demands, gene
 
     return allocation, total_power_delivered
 
-def system_state(adjacency_matrix, generators, generation, loads, demand):
-    bipartite_graph, component_demands = create_bipartite_graph(adjacency_matrix, generators, loads, demand)
+# ============================
+# Define System State Function
+# ============================
 
+def system_state(adjacency_matrix, generators, generation, loads, demand):
+    """
+    Calculates the system's efficiency metrics (x_eff and B_eff).
+
+    Args:
+        adjacency_matrix: 2D list representing the adjacency matrix.
+        generators: List of generator node indices.
+        generation: List of generator capacities.
+        loads: List of load node indices.
+        demand: List of load demands.
+
+    Returns:
+        x_eff: System efficiency.
+        B_eff: Effective efficiency metric as defined.
+    """
+    bipartite_graph, component_demands = create_bipartite_graph(adjacency_matrix, generators, loads, demand)
+    
+    # Print results
     print("Bipartite Graph:")
     for gen, comps in bipartite_graph.items():
         print(f"Generator {gen} -> Components {comps}")
 
     print("\nComponent Demands:")
-    for i, comp_dem in enumerate(component_demands):  # Renamed 'demand' to 'comp_dem'
+    for i, comp_dem in enumerate(component_demands):
         print(f"Component {i}: Total Demand = {comp_dem}")
 
-    # Optimize power distribution
+    # Optimize power distribution with refined prioritization
     allocation, total_power_delivered = optimize_power_distribution_refined(
         bipartite_graph, component_demands, generation
     )
-
+    
+    # Print results
     print("Power Allocation:")
     for i, row in enumerate(allocation):
-        print(f"Generator {i}: {row}")
+        print(f"Generator {generators[i]}: {row}")
 
     print(f"\nTotal Power Delivered: {total_power_delivered}")
 
     print("\nRemaining Demands for Each Component:")
     for i, comp_dem in enumerate(component_demands):
-        print(f"Component {i}: Remaining Demand = {comp_dem - sum(row[i] for row in allocation)}")
-
-    # Recompute 'components' since we need them for load states
-    # (We know create_bipartite_graph calls load_demand_by_component, so we can re-run that function)
-    components, _ = load_demand_by_component(adjacency_matrix, generators, loads, demand)
+        remaining = comp_dem - sum(row[i] for row in allocation)
+        print(f"Component {i}: Remaining Demand = {remaining}")
 
     # Step 1: Calculate component received power
-    component_received_power = [sum(row[comp] for row in allocation) for comp in range(len(component_demands))]
+    component_received_power = [sum(allocation[gen][comp] for gen in range(len(generators))) for comp in range(len(component_demands))]
 
-    # Step 2: Calculate load states using 'components' (not bipartite_graph.values())
+    # Step 2: Calculate load states using 'components'
+    components, _ = load_demand_by_component(adjacency_matrix, generators, loads, demand)
+
     load_states = {}
     for comp_index, comp_load_set in enumerate(components):
-        received_power_ratio = component_received_power[comp_index] / component_demands[comp_index] if component_demands[comp_index] > 0 else 0
+        received_power = component_received_power[comp_index]
+        total_demand = component_demands[comp_index]
+        received_power_ratio = received_power / total_demand if total_demand > 0 else 0
         for load in comp_load_set:
-            # 'load' is a load node, map it to 'demand'
-            load_desire = demand[loads.index(load)]
-            load_states[load] = load_desire * received_power_ratio
+            if load in loads:
+                load_desire = demand[loads.index(load)]
+                load_states[load] = load_desire * received_power_ratio
+            else:
+                print(f"Warning: Load {load} not found in loads.")
 
     # Step 3: Calculate x_eff
     x_eff_numerator = 0
@@ -265,8 +339,19 @@ def system_state(adjacency_matrix, generators, generation, loads, demand):
         x_eff_numerator += state * outgoing_degree
 
     x_eff = x_eff_numerator / x_eff_denominator if x_eff_denominator > 0 else 0
+
+    # Step 4: Calculate B_eff
+    B_eff = calculate_B_eff(adjacency_matrix, load_states)
+
+    # Print efficiency metrics
     print(f"\nSystem Efficiency (x_eff): {x_eff}")
-    return x_eff
+    print(f"System Efficiency (B_eff): {B_eff}")
+
+    return x_eff, B_eff
+
+# ============================
+# Define Simulation Functions
+# ============================
 
 def simulate_line_failure(f_l, adjacency_matrix, generators, generation, loads, demand):
     # Convert adjacency_matrix to a NumPy array if it isn't already
@@ -291,46 +376,170 @@ def simulate_line_failure(f_l, adjacency_matrix, generators, generation, loads, 
     for (i, j) in lines_removed:
         new_A[i][j] = 0
 
-    # Run the system state with the new adjacency matrix
-    system_state(new_A, generators, generation, loads, demand)
+    # Run system state
+    x_eff, B_eff = system_state(new_A, generators, generation, loads, demand)
 
-def simulate_demand_increase(f_d, adjacency_matrix, generators, generation, loads, demand):
-    # f_d: fraction increase in demand
-    # Increase each load's demand by (f_d * original_demand)
-    new_demand = [d * (1 + f_d) for d in demand]
-    system_state(adjacency_matrix, generators, new_demand, loads, new_demand)
-
-def simulate_generation_decrease(f_g, adjacency_matrix, generators, generation, loads, demand):
-    # f_g: fraction decrease in generation
-    # Decrease each generator's capacity by f_g of its original capacity
-    new_generation = [g * (1 - f_g) for g in generation]
-    system_state(adjacency_matrix, generators, new_generation, loads, demand)
+    # Record data
+    record_data(f"data/{SYSTEM_NAME}/line_failure_data.csv", f_l, x_eff, B_eff)
 
 def simulate_generator_failure(f_g, adjacency_matrix, generators, generation, loads, demand):
-    # f_g: fraction of generators to fail
-    # Randomly pick f_g * len(generators) generators and set their generation to zero
-    num_failures = int(f_g * len(generators))
-    failed_gens = random.sample(generators, num_failures)
+    """
+    Simulates generator failures by randomly removing a fraction f_g of generators.
 
-    new_generation = generation[:]
+    Args:
+        f_g: Fraction of generators to fail [0,1]
+        adjacency_matrix: 2D list representing the adjacency matrix
+        generators: List of generator node indices
+        generation: List of generator capacities
+        loads: List of load node indices
+        demand: List of load demands
+
+    Returns:
+        None
+    """
+    num_generators = len(generators)
+    num_failures = int(f_g * num_generators)
+    if num_failures == 0 and f_g > 0:
+        num_failures = 1  # At least one failure if f_g > 0
+
+    failed_gens = random.sample(generators, num_failures)
+    print(f"\nSimulating Generator Failure: {failed_gens}")
+
+    # Create a new adjacency matrix by removing all outgoing links from failed generators
+    new_A = [row.copy() for row in adjacency_matrix]
+    for gen in failed_gens:
+        for j in range(len(new_A[gen])):
+            new_A[gen][j] = 0  # Remove outgoing links
+
+    # Set their generation to 0
+    new_generation = generation.copy()
     for gen in failed_gens:
         gen_index = generators.index(gen)
         new_generation[gen_index] = 0
 
-    system_state(adjacency_matrix, generators, new_generation, loads, demand)
+    # Run system state
+    x_eff, B_eff = system_state(new_A, generators, new_generation, loads, demand)
+
+    # Record data
+    record_data(f"data/{SYSTEM_NAME}/generator_failure_data.csv", f_g, x_eff, B_eff)
+
+def simulate_demand_increase(f_d, adjacency_matrix, generators, generation, loads, demand):
+    """
+    Simulates an increase in demand by a fraction f_d.
+
+    Args:
+        f_d: Fraction to increase demand [0,1]
+        adjacency_matrix: 2D list representing the adjacency matrix
+        generators: List of generator node indices
+        generation: List of generator capacities
+        loads: List of load node indices
+        demand: List of load demands
+
+    Returns:
+        None
+    """
+    print(f"\nSimulating Demand Increase by {f_d*100}%")
+    new_demand = [d * (1 + f_d) for d in demand]
+    x_eff, B_eff = system_state(adjacency_matrix, generators, generation, loads, new_demand)
+    record_data(f"data/{SYSTEM_NAME}/demand_increase_data.csv", f_d, x_eff, B_eff)
+
+def simulate_generation_decrease(f_g, adjacency_matrix, generators, generation, loads, demand):
+    """
+    Simulates a decrease in generation capacity by a fraction f_g.
+
+    Args:
+        f_g: Fraction to decrease generation [0,1]
+        adjacency_matrix: 2D list representing the adjacency matrix
+        generators: List of generator node indices
+        generation: List of generator capacities
+        loads: List of load node indices
+        demand: List of load demands
+
+    Returns:
+        None
+    """
+    print(f"\nSimulating Generation Decrease by {f_g*100}%")
+    new_generation = [g * (1 - f_g) for g in generation]
+    x_eff, B_eff = system_state(adjacency_matrix, generators, new_generation, loads, demand)
+    record_data(f"data/{SYSTEM_NAME}/generation_decrease_data.csv", f_g, x_eff, B_eff)
 
 def simulate_load_failure(f_l, adjacency_matrix, generators, generation, loads, demand):
-    # f_l: fraction of loads to fail
-    # Randomly pick f_l * len(loads) loads and set their demand to zero
-    num_failures = int(f_l * len(loads))
+    """
+    Simulates load failures by randomly removing a fraction f_l of loads.
+
+    Args:
+        f_l: Fraction of loads to fail [0,1]
+        adjacency_matrix: 2D list representing the adjacency matrix
+        generators: List of generator node indices
+        generation: List of generator capacities
+        loads: List of load node indices
+        demand: List of load demands
+
+    Returns:
+        None
+    """
+    num_loads = len(loads)
+    num_failures = int(f_l * num_loads)
+    if num_failures == 0 and f_l > 0:
+        num_failures = 1  # At least one failure if f_l > 0
+
     failed_loads = random.sample(loads, num_failures)
+    print(f"\nSimulating Load Failure: {failed_loads}")
+    
+    # Create a new adjacency matrix by removing all outgoing links from failed generators
+    new_A = [row.copy() for row in adjacency_matrix]
+    for load in failed_loads:
+        for j in range(len(new_A[load])):
+            new_A[load][j] = 0  # Remove outgoing links
 
-    new_demand = demand[:]
-    for ld in failed_loads:
-        ld_index = loads.index(ld)
-        new_demand[ld_index] = 0
+    # Create a new demand list by setting failed loads' demand to 0
+    new_demand = demand.copy()
+    for load in failed_loads:
+        load_index = loads.index(load)
+        new_demand[load_index] = 0
 
-    system_state(adjacency_matrix, generators, generation, loads, new_demand)
+    # Run system state
+    x_eff, B_eff = system_state(new_A, generators, generation, loads, new_demand)
 
-system_state(adjacency_matrix, generators, generation, loads, demand)
-simulate_line_failure(0.5, adjacency_matrix, generators, generation, loads, demand)
+    # Record data
+    record_data(f"data/{SYSTEM_NAME}/load_failure_data.csv", f_l, x_eff, B_eff)
+
+
+
+# ============================
+# Main Execution
+# ============================
+
+if __name__ == "__main__":
+    # Load systems from JSON
+    with open("systems_config.json", "r") as f:
+        loaded_systems = json.load(f)
+
+    # Example: Use BaseSystem for simulation
+    selected_system = loaded_systems[SYSTEM_NAME]
+    generators = selected_system["generators"]
+    generation = selected_system["generation"]
+    loads = selected_system["loads"]
+    demand = selected_system["demand"]
+    adjacency_matrix = selected_system["adjacency_matrix"]
+
+    system_state(adjacency_matrix, generators, generation, loads, demand)
+    simulate_line_failure(0.1, adjacency_matrix, generators, generation, loads, demand)
+    system_state(adjacency_matrix, generators, generation, loads, demand)
+
+    f_i_values = [round(i * 0.05, 2) for i in range(21)]  # [0.0, 0.05, 0.10, ..., 1.0]
+    simulation_runs = 30
+    for system_name in ['IEEE14','IEEE30','IEEE57','IEEE118']:
+        SYSTEM_NAME = system_name
+        for f_i in f_i_values:
+            print(f"\n=== Simulation for f_i = {f_i} ===")
+            for run in range(1, simulation_runs + 1):
+                print(f"\n--- Run {run} for f_i = {f_i} ---")
+                # Simulate each type of failure/increase/decrease
+                simulate_line_failure(f_i, adjacency_matrix, generators, generation, loads, demand)
+                simulate_generator_failure(f_i, adjacency_matrix, generators, generation, loads, demand)
+                # simulate_demand_increase(f_i, adjacency_matrix, generators, generation, loads, demand)
+                # simulate_generation_decrease(f_i, adjacency_matrix, generators, generation, loads, demand)
+                simulate_load_failure(f_i, adjacency_matrix, generators, generation, loads, demand)
+
+    print("\n=== All Simulations Completed ===")
